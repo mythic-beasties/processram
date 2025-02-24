@@ -1,0 +1,278 @@
+#!/bin/bash
+
+# Munin plugin to graph what's using physical/swap memory
+# Relies on /proc/*/smaps, and then totals up all the values for subprocesses
+# However, smaps values are in KB, so theres some rounding involved.
+#
+# Originally Created Feb 2025 by Paul Cammish
+#
+# Works on Debian-based OS's (Ubuntu, Rapsberry Pi OS, etc), and may work on others.
+#
+# Must be run as root, so /etc/munin/plugin-conf.d/processram should exist so set this
+# List of PID files to report are in the 'pidfiles' variable from the config, with the format:
+#   <path to pid from root, with .pid suffix omitted>[=displayname_with_no_spaces]
+# if not configured, it'll just use all the pid files i can find in /run
+# 
+# two releated versions exist - selected by naming the symlink:
+# 1. if the link is named *_swap, it will report usage from the swap file
+# 2. if anything else (eg: *_phys), it will report physcial RAM usage.
+#
+# Munin Margic Markers:
+#
+#%# family=auto
+#%# capabilities=autoconf suggest
+
+set -e
+
+function read_config {
+        all_pids="$( while read path pidfile ; do echo -e "$( cat $path/$pidfile 2>/dev/null || echo 'null' )\t$path/$pidfile" | grep -v '^null' ; done  <<< $( find /run -name '*.pid' -printf '%h %f\n' 2>/dev/null ))"
+
+	# (this makes the vi syntax highligting a bit sad, but works fine)
+        run_pids="$(
+                # if we have a config thats defined what pidfiles to report on,
+                if [ "x$pidfiles" != "x" ]; then
+                        # filter pidfiles to just the mentioned ones
+                        for pidfile in $pidfiles ; do
+                                if [[ $pidfile == *"="* ]]; then
+                                        pidfile=$( echo "$pidfile" | cut -f 1 -d = )
+                                fi
+                                echo "$all_pids" | grep "/$pidfile.pid$" || echo -e "null\t/run/$pidfile.pid"
+                        done
+                else
+                        echo "$all_pids"
+                fi
+        )"
+
+        # if we have the pid files configured, then read the display names, else fall back to a default
+        if [ "x$pidfiles" != "x" ] && [[ $pidfiles == *"="* ]] ; then
+                # turn any display names into a basic list
+                display_names=$( echo $pidfiles | tr ' ' '\n' | grep '=' | tr '=' '\t' )
+        else
+                # else just set a blank string
+                display_names=""
+        fi
+
+}
+
+
+function output_config {
+
+	echo "graph_title RAM Usage ($mode_title)"
+	echo 'graph_args --base 1024 -l 0'
+	echo 'graph_category system'
+	echo "graph_info Shows how $mode_title memory is allocated, with how much each specfic process and its children uses. Values are approximate."
+	echo 'graph_vlabel Bytes'
+
+	read_config
+
+	pid_names=$( echo "$run_pids" | cut -f 2 | sed -e 's|^/run/||' -e 's|\.pid$||' | sort | grep . | tr '\n' ' ' )
+
+        # 'other' should be fairly stable, so we show it first, which also means we can set it as an area.
+	echo "other.label [Other]"
+        echo "other.draw AREA"
+        echo "other.info Other $mode_title memory used by processes not listed"
+
+	for pid_name in $pid_names; do
+
+		# simplify the display name
+		if [ "$( echo $pid_name | cut -f 1 -d '/' )" == "$( echo $pid_name | cut -f 2 -d '/' )" ]; then
+			display_name="$( echo $pid_name | cut -f 1 -d '/' )"
+		else
+			display_name="$pid_name"
+		fi
+		# check to see if we have any display_names defined
+             	if [ "x$display_names" != "x" ]; then
+                       	# check to see if we have an overridden display name set
+                        if [ $( echo -e "$display_names" | grep -Pc "$pid_name\t" ) -gt 0 ]; then
+				display_name=$( echo -e "$display_names" | grep -P "$pid_name\t" | cut -f 2 )
+	                fi
+	        fi
+
+		# sanitise the pid name into the token
+		token="pid_$( echo "$pid_name" | tr '/' '_' | tr -cd '[:alnum:]_' )"
+
+		# echo the info out
+		echo "$token.label $display_name"
+		echo "$token.draw STACK"
+		echo "$token.info $( echo "$run_pids" | grep "$pid_name.pid$" | cut -f 2 )"
+	done
+
+	# theres no 'Shared' ram for swap, so onkly show that if we're using
+	if $phys ; then
+	        echo 'shared.label [Shared]'
+	        echo 'shared.draw STACK'
+	        echo 'shared.colour aaaaaa'
+	        echo 'shared.info Shared memory in use by multiple processes'
+	fi
+
+        echo 'free.label [Free]'
+        echo 'free.draw STACK'
+	echo 'free.colour ffffff'
+        echo "free.info Free $mode_title memory available"
+
+	# no cache usage for swap either
+	if $phys ; then
+	        echo 'cache.label [Cache]'
+	        echo 'cache.draw STACK'
+		echo 'cache.colour dddddd'
+	        echo 'cache.info Memory curently used by caching, but otherwise available if needed'
+	fi
+
+}
+
+
+
+function output_values() {
+
+	read_config
+
+	# list the pid's we want to return
+	want_pids="$( echo -e "$( echo "$run_pids" | cut -f 1 )" )"
+
+	# turn the list of pids into a regexp for easy usage
+	want_pids_regexp=$( echo "$want_pids" | sort -n | sed -e 's|^|^|' -e 's|$|$\\\||' | tr -d '\n' | sed 's/\\|$//' )
+
+	ram_parent=0
+	ram_other=0
+	ram_uncounted="$( free --kibi | grep '^Mem:' | awk '{ print $2 }' )"
+
+	# annoying workaround, as tac and mktmp want access to bits of tmp the chroot munin runs in can't see
+	# create a temp file
+	if $phys ; then
+		pidfile="/tmp/.ramusage_phys_$( openssl rand -hex 12 )"
+	else
+		pidfile="/tmp/.ramusage_swap_$( openssl rand -hex 12 )"
+	fi
+
+	# capture PSS data
+        # if the process disappeares before grep gets to it, ignore it
+        pss="$( grep -s "^$mode_pss:" /proc/*/smaps | grep -v ' 0 kB$' )"
+        # this will be a little inaccurate but within margins
+        # note that this outputs values in kB, so we need to multiplay the results by 1024 for munin
+
+	# capture pid info
+	ps fwaxo pid=,ppid=,args= > $pidfile
+
+        # grab the free stats now, rather than later, as they'll likely be a bit different by then
+        free_stats=$( free --kibi | grep "^$mode_free:" )
+
+	# now we have some time free, reverse the data form the pidfile and store it in $pids, then remove the temp file
+	pids="$( tac $pidfile )"
+	rm $pidfile
+
+	# we have all the data we need now, so read through the data in $pids and total things up
+	while read pid ppid args ; do
+
+		# grab the ram used by this pid from the pss data
+		ram=$( echo "$pss" | grep "^/proc/$pid/smaps:$mode_pss:" | awk '{ sum+=$2; } END{ print sum; }' )
+
+		# if we don't have ram data for this pid (ie: no match in pss data), assume its zero
+		if [ "x$ram" = "x" ]; then ram=0 ; fi
+
+		# if we have a zero value, continue to the next pid
+		if [ $ram -eq 0 ]; then continue ; fi
+
+		# subtract the ram used from ram_uncounted
+		ram_uncounted="$((ram_uncounted-$ram))"
+
+		# add the amount of ram used by this process to the total of ram for the parent and children
+		ram_parent="$((ram_parent+$ram))"
+
+		# is the parent process 1 and we're at the root of the tree? or is the pid in the list of pid's we're looking for?
+		if [ $ppid -eq 1 ] || [ $( echo "$pid" | grep "$want_pids_regexp" | wc -l ) -eq 1 ]; then
+
+			# get the relevant pid name from the $run_pids list, if its there
+			pid_name=$( echo "$run_pids" | grep -P "^$pid\t" | cut -f 2 | sed -e 's|^/run/||' -e 's|\.pid$||' )
+
+
+
+			# if theres no pid_name...
+			if [ "x$pid_name" == "x" ]; then
+				# then this must be another process we arent bothered about, so add the total of ram used to $ram_other
+				ram_other="$((ram_other+$ram_parent))"
+			else
+				# else we have a pid we want to report on
+				# sanitise the tokens name - doesn't contain anything other than 'A-Za-z0-9_'
+				token="pid_$( echo "$pid_name" | tr '/' '_' | tr -cd '[:alnum:]_' )"
+				# output the result with the token
+				echo "$token.value $((ram_parent*1024))"
+			fi
+
+			# reset ram_parent
+			ram_parent=0
+		fi
+
+	done <<< $( echo "$pids" )
+
+	# output the amount of ram used by other processes
+	echo "other.value $((ram_other*1024))"
+
+	# ram available includes ram allocated to buffers/cache, so we need to
+	# get the value of the cache, then remove that to calculate ram_free, and then make it into bytes
+
+	ram_free=$( echo "$free_stats" | awk '{ print $4 }' )
+
+	if $phys ; then
+		ram_shared=$( echo "$free_stats" | awk '{ print $5 }' )
+
+		# Cache used is *implied* from the amount of ram_uncounted - the ram_free. the measured values seem to be fairly inaccurate in free
+		ram_cache=$((ram_uncounted-$ram_free))
+	fi
+
+	# the above is all in KB, but munin wants bytes, so we multiply these values for output
+	if $phys ; then
+		echo "shared.value $((ram_shared*1024))"
+		echo "cache.value $((ram_cache*1024))"
+	fi
+	echo "free.value $((ram_free*1024))"
+
+
+}
+
+# basic setup
+#
+# Most of the code is the same, so we check the name it's being invoked by to work out
+#   which set of output data to return, and then set suitable variables
+
+if [ "$( echo "$0" | sed 's|.*_||' )" == "swap" ]; then
+	phys=false
+	mode_title='swap'
+	mode_pss='SwapPss'
+	mode_free='Swap'
+else
+	phys=true
+	mode_title='physical'
+	mode_pss='Pss'
+	mode_free='Mem'
+fi
+
+case $# in
+    0)
+        output_values
+        ;;
+    1)
+        case $1 in
+            config)
+                output_config
+                ;;
+	    autoconf)
+		# reply 'yes' to autoconf, as this needs a config which should be installed with it
+		if grep -c ^Pss /proc/1/smaps >/dev/null ; then
+			echo yes
+		else
+			echo no
+		fi
+		;;
+	    suggest)
+		echo phys
+		echo swap
+		;;
+            *)
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        exit 1
+        ;;
+esac
